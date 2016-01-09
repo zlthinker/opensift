@@ -34,6 +34,7 @@ static IplImage*** build_dog_pyr( IplImage***, int, int );
 static CvSeq* scale_space_extrema( IplImage***, int, int, double, int,
 				   CvMemStorage*);
 static int is_extremum( IplImage***, int, int, int, int );
+static int is_extremum_nms( IplImage***, int, int, int, int );
 static struct feature* interp_extremum( IplImage***, int, int, int, int, int,
 					double);
 static void interp_step( IplImage***, int, int, int, int, double*, double*,
@@ -153,7 +154,7 @@ int _sift_features( IplImage* img, struct feature** feat, int intvls,
       free( (*feat)[i].feature_data );
       (*feat)[i].feature_data = NULL;
     }
-  
+
   cvReleaseMemStorage( &storage );
   cvReleaseImage( &init_img );
   release_pyr( &gauss_pyr, octvs, intvls + 3 );
@@ -208,7 +209,7 @@ static IplImage* create_init_img( IplImage* img, int img_dbl, double sigma )
 static IplImage* convert_to_gray32( IplImage* img )
 {
   IplImage* gray8, * gray32;
-  
+
   gray32 = cvCreateImage( cvGetSize(img), IPL_DEPTH_32F, 1 );
   if( img->nChannels == 1 )
     gray8 = cvClone( img );
@@ -253,7 +254,7 @@ static IplImage*** build_gauss_pyr( IplImage* base, int octvs,
 
     \sigma_{total}^2 = \sigma_{i}^2 + \sigma_{i-1}^2
 
-    sig[i] is the incremental sigma value needed to compute 
+    sig[i] is the incremental sigma value needed to compute
     the actual sigma of level i. Keeping track of incremental
     sigmas vs. total sigmas keeps the gaussian kernel small.
   */
@@ -272,7 +273,7 @@ static IplImage*** build_gauss_pyr( IplImage* base, int octvs,
 	/* base of new octvave is halved image from end of previous octave */
 	else if( i == 0 )
 	  gauss_pyr[o][i] = downsample( gauss_pyr[o-1][intvls] );
-	  
+
 	/* blur the current octave's last image to create the next one */
 	else
 	  {
@@ -371,7 +372,7 @@ static CvSeq* scale_space_extrema( IplImage*** dog_pyr, int octvs, int intvls,
 	for(c = SIFT_IMG_BORDER; c < dog_pyr[o][0]->width-SIFT_IMG_BORDER; c++)
 	  /* perform preliminary check on contrast */
 	  if( ABS( pixval32f( dog_pyr[o][i], r, c ) ) > prelim_contr_thr )
-	    if( is_extremum( dog_pyr, o, i, r, c ) )
+	    if( is_extremum_nms( dog_pyr, o, i, r, c ) )
 	      {
 		feat = interp_extremum(dog_pyr, o, i, r, c, intvls, contr_thr);
 		if( feat )
@@ -387,11 +388,52 @@ static CvSeq* scale_space_extrema( IplImage*** dog_pyr, int octvs, int intvls,
 		    free( feat );
 		  }
 	      }
-  
+
   return features;
 }
 
+//non-minimal suspress for candidate feature points
+static int is_extremum_nms( IplImage*** dog_pyr, int octv, int intvl, int r, int c )
+{
+  double val = pixval32f( dog_pyr[octv][intvl], r, c );
+  int i, j, k;
 
+  /* check for maximum */
+  if( val > 0 )
+    {
+	for( j = -1; j <= 1; j++ )
+	  for( k = -1; k <= 1; k++ )
+	    if( val < pixval32f( dog_pyr[octv][intvl-1], r + j, c + k ) )
+	      return 0;
+  for( j = -1; j <= 1; j++ )
+    for( k = -1; k <= 1; k++ )
+      if( val < pixval32f( dog_pyr[octv][intvl+1], r + j, c + k ) )
+      	return 0;
+  for( j = -5; j <= 5; j++ )
+    for( k = -5; k <= 5; k++ )
+      if( val < pixval32f( dog_pyr[octv][intvl], r + j, c + k ) )
+      	return 0;
+    }
+
+  /* check for minimum */
+  else
+    {
+      for( j = -1; j <= 1; j++ )
+    	  for( k = -1; k <= 1; k++ )
+    	    if( val > pixval32f( dog_pyr[octv][intvl-1], r + j, c + k ) )
+    	      return 0;
+      for( j = -1; j <= 1; j++ )
+        for( k = -1; k <= 1; k++ )
+          if( val > pixval32f( dog_pyr[octv][intvl+1], r + j, c + k ) )
+          	return 0;
+      for( j = -5; j <= 5; j++ )
+        for( k = -5; k <= 5; k++ )
+          if( val > pixval32f( dog_pyr[octv][intvl], r + j, c + k ) )
+          	return 0;
+    }
+
+  return 1;
+}
 
 /*
   Determines whether a pixel is a scale-space extremum by comparing it to it's
@@ -439,7 +481,7 @@ static int is_extremum( IplImage*** dog_pyr, int octv, int intvl, int r, int c )
 /*
   Interpolates a scale-space extremum's location and scale to subpixel
   accuracy to form an image feature.  Rejects features with low contrast.
-  Based on Section 4 of Lowe's paper.  
+  Based on Section 4 of Lowe's paper.
 
   @param dog_pyr DoG scale space pyramid
   @param octv feature's octave of scale space
@@ -462,17 +504,17 @@ static struct feature* interp_extremum( IplImage*** dog_pyr, int octv,
   struct detection_data* ddata;
   double xi, xr, xc, contr;
   int i = 0;
-  
+
   while( i < SIFT_MAX_INTERP_STEPS )
     {
       interp_step( dog_pyr, octv, intvl, r, c, &xi, &xr, &xc );
       if( ABS( xi ) < 0.5  &&  ABS( xr ) < 0.5  &&  ABS( xc ) < 0.5 )
 	break;
-      
+
       c += cvRound( xc );
       r += cvRound( xr );
       intvl += cvRound( xi );
-      
+
       if( intvl < 1  ||
 	  intvl > intvls  ||
 	  c < SIFT_IMG_BORDER  ||
@@ -482,14 +524,14 @@ static struct feature* interp_extremum( IplImage*** dog_pyr, int octv,
 	{
 	  return NULL;
 	}
-      
+
       i++;
     }
-  
+
   /* ensure convergence of interpolation */
   if( i >= SIFT_MAX_INTERP_STEPS )
     return NULL;
-  
+
   contr = interp_contr( dog_pyr, octv, intvl, r, c, xi, xr, xc );
   if( ABS( contr ) < contr_thr / intvls )
     return NULL;
@@ -528,14 +570,14 @@ static void interp_step( IplImage*** dog_pyr, int octv, int intvl, int r, int c,
 {
   CvMat* dD, * H, * H_inv, X;
   double x[3] = { 0 };
-  
+
   dD = deriv_3D( dog_pyr, octv, intvl, r, c );
   H = hessian_3D( dog_pyr, octv, intvl, r, c );
   H_inv = cvCreateMat( 3, 3, CV_64FC1 );
   cvInvert( H, H_inv, CV_SVD );
   cvInitMatHeader( &X, 3, 1, CV_64FC1, x, CV_AUTOSTEP );
   cvGEMM( H_inv, dD, -1, NULL, 0, &X, 0 );
-  
+
   cvReleaseMat( &dD );
   cvReleaseMat( &H );
   cvReleaseMat( &H_inv );
@@ -571,7 +613,7 @@ static CvMat* deriv_3D( IplImage*** dog_pyr, int octv, int intvl, int r, int c )
 	 pixval32f( dog_pyr[octv][intvl], r-1, c ) ) / 2.0;
   ds = ( pixval32f( dog_pyr[octv][intvl+1], r, c ) -
 	 pixval32f( dog_pyr[octv][intvl-1], r, c ) ) / 2.0;
-  
+
   dI = cvCreateMat( 3, 1, CV_64FC1 );
   cvmSet( dI, 0, 0, dx );
   cvmSet( dI, 1, 0, dy );
@@ -602,9 +644,9 @@ static CvMat* hessian_3D( IplImage*** dog_pyr, int octv, int intvl, int r,
 {
   CvMat* H;
   double v, dxx, dyy, dss, dxy, dxs, dys;
-  
+
   v = pixval32f( dog_pyr[octv][intvl], r, c );
-  dxx = ( pixval32f( dog_pyr[octv][intvl], r, c+1 ) + 
+  dxx = ( pixval32f( dog_pyr[octv][intvl], r, c+1 ) +
 	  pixval32f( dog_pyr[octv][intvl], r, c-1 ) - 2 * v );
   dyy = ( pixval32f( dog_pyr[octv][intvl], r+1, c ) +
 	  pixval32f( dog_pyr[octv][intvl], r-1, c ) - 2 * v );
@@ -622,7 +664,7 @@ static CvMat* hessian_3D( IplImage*** dog_pyr, int octv, int intvl, int r,
 	  pixval32f( dog_pyr[octv][intvl+1], r-1, c ) -
 	  pixval32f( dog_pyr[octv][intvl-1], r+1, c ) +
 	  pixval32f( dog_pyr[octv][intvl-1], r-1, c ) ) / 4.0;
-  
+
   H = cvCreateMat( 3, 3, CV_64FC1 );
   cvmSet( H, 0, 0, dxx );
   cvmSet( H, 0, 1, dxy );
@@ -904,7 +946,7 @@ static void smooth_ori_hist( double* hist, int n )
   for( i = 0; i < n; i++ )
     {
       tmp = hist[i];
-      hist[i] = 0.25 * prev + 0.5 * hist[i] + 
+      hist[i] = 0.25 * prev + 0.5 * hist[i] +
 	0.25 * ( ( i+1 == n )? h0 : hist[i+1] );
       prev = tmp;
     }
@@ -966,7 +1008,7 @@ static void add_good_ori_features( CvSeq* features, double* hist, int n,
     {
       l = ( i == 0 )? n - 1 : i-1;
       r = ( i + 1 ) % n;
-      
+
       if( hist[i] > hist[l]  &&  hist[i] > hist[r]  &&  hist[i] >= mag_thr )
 	{
 	  bin = i + interp_hist_peak( hist[l], hist[i], hist[r] );
@@ -1063,7 +1105,7 @@ static double*** descr_hist( IplImage* img, int r, int c, double ori,
       for( j = 0; j < d; j++ )
 	hist[i][j] = calloc( n, sizeof( double ) );
     }
-  
+
   cos_t = cos( ori );
   sin_t = sin( ori );
   bins_per_rad = n / PI2;
@@ -1082,7 +1124,7 @@ static double*** descr_hist( IplImage* img, int r, int c, double ori,
 	r_rot = ( j * sin_t + i * cos_t ) / hist_width;
 	rbin = r_rot + d / 2 - 0.5;
 	cbin = c_rot + d / 2 - 0.5;
-	
+
 	if( rbin > -1.0  &&  rbin < d  &&  cbin > -1.0  &&  cbin < d )
 	  if( calc_grad_mag_ori( img, r + i, c + j, &grad_mag, &grad_ori ))
 	    {
@@ -1091,7 +1133,7 @@ static double*** descr_hist( IplImage* img, int r, int c, double ori,
 		grad_ori += PI2;
 	      while( grad_ori >= PI2 )
 		grad_ori -= PI2;
-	      
+
 	      obin = grad_ori * bins_per_rad;
 	      w = exp( -(c_rot * c_rot + r_rot * r_rot) / exp_denom );
 	      interp_hist_entry( hist, rbin, cbin, obin, grad_mag * w, d, n );
@@ -1165,7 +1207,7 @@ static void interp_hist_entry( double*** hist, double rbin, double cbin,
 /*
   Converts the 2D array of orientation histograms into a feature's descriptor
   vector.
-  
+
   @param hist 2D array of orientation histograms
   @param d width of hist
   @param n bins per histogram
